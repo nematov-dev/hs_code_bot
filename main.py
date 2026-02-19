@@ -31,16 +31,13 @@ DB_CONFIG = {
 }
 
 genai.configure(api_key=GEMINI_API_KEY)
-# Model nomi to'g'irlandi (gemini-2.5 mavjud emas, 1.5-flash ishlatildi)
-gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
 logging.basicConfig(level=logging.INFO)
 
 # MAXSUS FUNKSIYALAR
 def escape_md(text):
-    """MarkdownV2 uchun barcha maxsus belgilarni to'suvchi funksiya"""
     if text is None: return ""
-    # MarkdownV2 uchun barcha rezerv qilingan belgilar:
     parse_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(parse_chars)}])', r'\\\1', str(text))
 
@@ -100,8 +97,7 @@ class SubscriptionMiddleware(BaseMiddleware):
         
         if isinstance(event, types.Message) and event.text == "🤖 AI qidiruv":
             if user.id != ADMIN_ID and not is_premium:
-                # Xabar escape qilindi
-                await event.answer(escape_md("⚠️ AI qidiruv faqat Premium foydalanuvchilar uchun!\nPremium olish uchun admin bilan bog'laning: @ZufarNurmatov"), parse_mode="MarkdownV2")
+                await event.answer(escape_md("⚠️ AI qidiruv faqat Premium foydalanuvchilar uchun!\nAdmin: @ZufarNurmatov"), parse_mode="MarkdownV2")
                 return
         
         return await handler(event, data)
@@ -169,7 +165,6 @@ async def send_results(message_obj, query, page, s_type):
     if len(filtered_indices) > start_idx + items_per_page:
         builder.add(InlineKeyboardButton(text="Oldinga ➡️", callback_data=f"next_{s_type}_{query}_{page}"))
     
-    # Xabar hajmini tekshirish
     if len(text) > 4000: text = text[:4000] + "\.\.\."
 
     try:
@@ -180,15 +175,23 @@ async def send_results(message_obj, query, page, s_type):
     except Exception as e:
         logging.error(f"TG Send Error: {e}")
 
-# HANDLERLAR
+# --- HANDLERLAR ---
+
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
-    kb = [[KeyboardButton(text="🔎 Nom bo'yicha"), KeyboardButton(text="🔢 Kod bo'yicha")],
-          [KeyboardButton(text="🤖 AI qidiruv"), KeyboardButton(text="👤 Hisobim")],
-          [KeyboardButton(text="📗 Foydali bo'lim")]]
-    if message.from_user.id == ADMIN_ID: kb.append([KeyboardButton(text="⚙️ Admin Panel")])
-    await message.answer(escape_md("TIF TN kodlarini qidirish botiga xush kelibsiz!"), 
-                         reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True), parse_mode="MarkdownV2")
+    kb = [
+        [KeyboardButton(text="🔎 Nom bo'yicha"), KeyboardButton(text="🔢 Kod bo'yicha")],
+        [KeyboardButton(text="🤖 AI qidiruv"), KeyboardButton(text="👤 Hisobim")],
+        [KeyboardButton(text="📗 Foydali bo'lim")]
+    ]
+    if message.from_user.id == ADMIN_ID:
+        kb.append([KeyboardButton(text="⚙️ Admin Panel")])
+    
+    await message.answer(
+        escape_md("TIF TN kodlarini qidirish botiga xush kelibsiz!"), 
+        reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True), 
+        parse_mode="MarkdownV2"
+    )
 
 @dp.message(F.text == "👤 Hisobim")
 async def profile(message: types.Message):
@@ -202,6 +205,35 @@ async def profile(message: types.Message):
             f"📅 *Muddati:* {date_str}")
     await message.answer(text, parse_mode="MarkdownV2")
 
+@dp.message(F.text == "📗 Foydali bo'lim")
+async def useful_section(message: types.Message):
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📖 TIF TN Qoidalari")],
+        [KeyboardButton(text="🔤 Qisqartmalar va Ramzlar")],
+        [KeyboardButton(text="⚖️ O'lchov birliklari")],
+        [KeyboardButton(text="🏠 Bosh sahifa")]
+    ], resize_keyboard=True)
+    await message.answer("Kerakli hujjatni tanlang:", reply_markup=kb)
+
+@dp.message(F.text.in_(["📖 TIF TN Qoidalari", "🔤 Qisqartmalar va Ramzlar", "⚖️ O'lchov birliklari"]))
+async def send_docs(message: types.Message):
+    docs = {
+        "📖 TIF TN Qoidalari": ("qoidalar.pdf", "TIF TN talqin etish qoidalari"),
+        "🔤 Qisqartmalar va Ramzlar": ("qisqartmalar.pdf", "Qisqartmalar va ramzlar ro'yxati"),
+        "⚖️ O'lchov birliklari": ("birliklar.pdf", "TIF TN o'lchov birliklari")
+    }
+    file_info = docs.get(message.text)
+    try:
+        file = FSInputFile(f"documents/{file_info[0]}")
+        await message.answer_document(document=file, caption=file_info[1])
+    except:
+        await message.answer("❌ Hujjat serverdan topilmadi.")
+
+@dp.message(F.text == "🏠 Bosh sahifa")
+async def go_home(message: types.Message):
+    await start_cmd(message)
+
+# QIDIRUVLAR
 @dp.message(F.text == "🔎 Nom bo'yicha")
 async def n_q(message: types.Message, state: FSMContext): 
     await state.set_state(Form.by_name)
@@ -224,65 +256,32 @@ async def c_h(message: types.Message, state: FSMContext):
     else: await message.answer("❌ Faqat raqam kiriting.")
     await state.clear()
 
-@dp.callback_query(F.data.startswith(("next_", "prev_")))
-async def pagin(call: types.CallbackQuery):
-    parts = call.data.split("_")
-    action, s_type, query, page = parts[0], parts[1], parts[2], int(parts[3])
-    new_page = page + 1 if action == "next" else max(0, page - 1)
-    await send_results(call, query, new_page, s_type)
-    await call.answer()
-
 # AI QIDIRUV
 @dp.message(F.text == "🤖 AI qidiruv")
 async def ai_q(message: types.Message, state: FSMContext): 
     await state.set_state(Form.by_ai)
     await message.answer("Mahsulotni tasvirlang (AI eng mos terminni topadi):")
 
-
 @dp.message(Form.by_ai)
 async def ai_h(message: types.Message, state: FSMContext):
     st = await message.answer(escape_md("🤖 AI Deklarant tahlil qilmoqda..."), parse_mode="MarkdownV2")
     try:
-        # Prompt o'zgartirildi: AI endi murakkab jumla emas, bazadan topish oson bo'lgan yakka so'zlar beradi
-        prompt = (
-            f"Siz professional bojxona deklarantisiz. Foydalanuvchi '{message.text}' deb kiritdi. "
-            f"Ushbu mahsulotni TIF TN bazasidan topish uchun 3 ta eng muhim kalit so'zni "
-            f"kirill alifbosida, faqat vergul bilan ajratib yozing. "
-            f"Masalan: 'Playstation' bo'lsa, 'видео ўйин, консол, ускуна' deb yozing."
-        )
+        prompt = (f"Siz professional bojxona deklarantisiz. Foydalanuvchi '{message.text}' deb kiritdi. "
+                  f"TIF TN bazasi uchun 3 ta kalit so'zni kirillda, vergul bilan yozing.")
         response = await asyncio.to_thread(gemini_model.generate_content, prompt)
-        
         if response and response.text:
-            # AI dan kelgan so'zlarni massivga olamiz
-            raw_keywords = response.text.strip().replace('*', '').split(',')
-            keywords = [k.strip() for k in raw_keywords if len(k.strip()) > 2]
-            
+            keywords = [k.strip() for k in response.text.strip().split(',') if len(k.strip()) > 2]
             found = False
             for kw in keywords:
-                # get_dynamic_pattern so'zning o'zagini qidiradi
                 pattern = f"(?:{get_dynamic_pattern(kw)})|(?:{get_dynamic_pattern(to_cyrillic(kw))})"
-                
-                # Bazadan qidirish
-                mask = df['description'].astype(str).str.contains(pattern, case=False, na=False, regex=True)
-                if mask.any():
+                if df['description'].astype(str).str.contains(pattern, case=False, na=False, regex=True).any():
                     await st.delete()
-                    # Agar topilsa, o'sha kalit so'z bo'yicha natijalarni chiqaramiz
                     await send_results(message, kw, 0, "name")
-                    found = True
-                    break
-            
-            if not found:
-                await st.edit_text(
-                    escape_md(f"❌ AI bazadan moslik topolmadi."), 
-                    parse_mode="MarkdownV2"
-                )
-        else:
-            await st.edit_text("❌ AI tahlil qila olmadi.")
-    except Exception as e:
-        logging.error(f"AI Error: {e}")
-        await st.edit_text("❌ Xatolik yuz berdi.")
+                    found = True; break
+            if not found: await st.edit_text(escape_md("❌ AI moslik topolmadi."), parse_mode="MarkdownV2")
+        else: await st.edit_text("❌ AI javob bermadi.")
+    except: await st.edit_text("❌ Xatolik.")
     await state.clear()
-
 
 # ADMIN PANEL
 @dp.message(F.text == "⚙️ Admin Panel", F.from_user.id == ADMIN_ID)
@@ -291,25 +290,27 @@ async def admin_main(message: types.Message):
     cur.execute("SELECT COUNT(*) FROM users_hs"); total = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM users_hs WHERE is_premium = TRUE"); premiums = cur.fetchone()[0]
     cur.close(); conn.close()
-
     stat_text = (f"📊 *Statistika*\n\n👥 Jami: `{total}`\n🌟 Premium: `{premiums}`")
     ikb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Obuna Berish", callback_data="adm_sub")]])
     await message.answer(stat_text, reply_markup=ikb, parse_mode="MarkdownV2")
 
-@dp.callback_query(F.data == "adm_sub", F.from_user.id == ADMIN_ID)
+@dp.callback_query(F.data == "adm_sub")
 async def sub_start(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(Form.admin_give_id)
-    await call.message.answer("ID kiriting:")
+    await call.message.answer("Premium beriladigan foydalanuvchi ID raqamini kiriting:")
     await call.answer()
 
 @dp.message(Form.admin_give_id)
 async def sub_id_received(message: types.Message, state: FSMContext):
     if not message.text.isdigit(): return await message.answer("Faqat raqam!")
     await state.update_data(target_id=message.text)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="30 Kun", callback_data="dur_30")]])
-    await message.answer(f"ID: {message.text} uchun muddat:", reply_markup=kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 Kun", callback_data="dur_1"), InlineKeyboardButton(text="1 Hafta", callback_data="dur_7")],
+        [InlineKeyboardButton(text="1 Oy", callback_data="dur_30"), InlineKeyboardButton(text="1 Yil", callback_data="dur_365")]
+    ])
+    await message.answer(f"ID: {message.text} uchun muddatni tanlang:", reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("dur_"), F.from_user.id == ADMIN_ID)
+@dp.callback_query(F.data.startswith("dur_"))
 async def sub_finish(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data(); target_id = int(data.get("target_id"))
     days = int(call.data.split("_")[1])
@@ -319,8 +320,24 @@ async def sub_finish(call: types.CallbackQuery, state: FSMContext):
     cur.execute("UPDATE users_hs SET is_premium = TRUE, sub_end_date = %s WHERE user_id = %s", (new_end, target_id))
     conn.commit(); cur.close(); conn.close()
     
-    await call.message.edit_text(escape_md(f"✅ ID {target_id} premium qilindi."), parse_mode="MarkdownV2")
+    await call.message.edit_text(escape_md(f"✅ ID {target_id} uchun {days} kunlik premium faollashtirildi."), parse_mode="MarkdownV2")
+    
+    # FOYDALANUVCHIGA XABAR YUBORISH
+    try:
+        msg = f"🎉 Tabriklaymiz! Sizga {days} kunlik Premium obuna berildi.\nAmal qilish muddati: {new_end.strftime('%d.%m.%Y')}"
+        await bot.send_message(target_id, escape_md(msg), parse_mode="MarkdownV2")
+    except Exception as e:
+        logging.error(f"Userga xabar ketmadi: {e}")
+        
     await state.clear()
+
+@dp.callback_query(F.data.startswith(("next_", "prev_")))
+async def pagin(call: types.CallbackQuery):
+    parts = call.data.split("_")
+    action, s_type, query, page = parts[0], parts[1], parts[2], int(parts[3])
+    new_page = page + 1 if action == "next" else max(0, page - 1)
+    await send_results(call, query, new_page, s_type)
+    await call.answer()
 
 async def main():
     await dp.start_polling(bot)
