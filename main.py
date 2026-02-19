@@ -218,7 +218,7 @@ async def manual_cmd(message: types.Message):
         "3. AI qidiruv (Premium): Mahsulotni xalq tilida tasvirlang, AI uni qidiradi.\n"
         "4. Foydali bo'lim: TIF TN qoidalari va PDF hujjatlar.\n"
         "5. Hisobim: ID raqamingiz va premium muddatini ko'rish.\n\n"
-        "🌟 Premium obuna: @ZufarNurmatov\n\n"
+        "🌟 Premium obuna olish uchun: @ZufarNurmatov\n\n"
         "❗ Kodlar faqat tavsiya sifatida beriladi!"
     )
     
