@@ -144,7 +144,7 @@ The bot logs errors and information via Python's `logging` module.
 ## How to Run
 
 ```bash
-python bot.py
+python main.py
 ```
 
 Or using asyncio:
