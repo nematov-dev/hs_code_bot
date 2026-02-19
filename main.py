@@ -210,17 +210,25 @@ async def start_cmd(message: types.Message):
 
 @dp.message(F.text == "📖 Qo'llanma")
 async def manual_cmd(message: types.Message):
-    text = (
-        "📚 *Botdan foydalanish bo'yicha qo'llanma:*\n\n"
-        "1️⃣ *Nom bo'yicha:* Mahsulot nomini kiritasiz va bazadan mos keluvchi TIF TN kodlarini topasiz.\n"
-        "2️⃣ *Kod bo'yicha:* Agar sizda kod bo'lsa, uning tavsifini va o'lchov birligini bilish uchun foydalaning.\n"
-        "3️⃣ *AI qidiruv (Premium):* Mahsulotni xalq tilida tasvirlang, Sun'iy intellekt uni bojxona terminologiyasiga o'girib qidiradi.\n"
-        "4️⃣ *Foydali bo'lim:* TIF TN qoidalari va o'lchov birliklari haqida PDF hujjatlar.\n"
-        "5️⃣ *Hisobim:* ID raqamingiz va premium muddatini ko'rish.\n\n"
-        "🌟 *Premium obuna:* AI qidiruvdan cheksiz foydalanish uchun @ZufarNurmatov ga murojaat qiling.\n\n"
-        "❗ *Kodlar faqat tavsiya sifatida beriladi*"
+    # Matnni oddiy formatda yozib, keyin escape qilamiz
+    raw_text = (
+        "📚 Botdan foydalanish bo'yicha qo'llanma:\n\n"
+        "1. Nom bo'yicha: Mahsulot nomini kiritasiz va bazadan mos keluvchi TIF TN kodlarini topasiz.\n"
+        "2. Kod bo'yicha: Agar sizda kod bo'lsa, uning tavsifini va o'lchov birligini bilish uchun foydalaning.\n"
+        "3. AI qidiruv (Premium): Mahsulotni xalq tilida tasvirlang, AI uni qidiradi.\n"
+        "4. Foydali bo'lim: TIF TN qoidalari va PDF hujjatlar.\n"
+        "5. Hisobim: ID raqamingiz va premium muddatini ko'rish.\n\n"
+        "🌟 Premium obuna: @ZufarNurmatov\n\n"
+        "❗ Kodlar faqat tavsiya sifatida beriladi!"
     )
-    await message.answer(text, parse_mode="MarkdownV2")
+    
+    # escape_md funksiyasi orqali xavfsiz holatga keltiramiz
+    safe_text = escape_md(raw_text)
+    
+    # Muhim: qalin matnlarni escape_md dan keyin qo'lda belgilash xavfsizroq
+    safe_text = safe_text.replace("Botdan foydalanish bo'yicha qo'llanma", "*Botdan foydalanish bo'yicha qo'llanma*")
+    
+    await message.answer(safe_text, parse_mode="MarkdownV2")
 
 @dp.message(F.text == "👤 Hisobim")
 async def profile(message: types.Message):
