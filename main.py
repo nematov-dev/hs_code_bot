@@ -286,21 +286,44 @@ async def ai_q(message: types.Message, state: FSMContext):
 async def ai_h(message: types.Message, state: FSMContext):
     st = await message.answer(escape_md("🤖 AI Deklarant tahlil qilmoqda..."), parse_mode="MarkdownV2")
     try:
-        prompt = (f"Siz professional bojxona deklarantisiz. Foydalanuvchi '{message.text}' deb kiritdi. "
-                  f"TIF TN bazasi uchun 3 ta kalit so'zni kirillda, faqat vergul bilan yozing.")
+        # Prompt o'zgartirildi: AI endi murakkab jumla emas, bazadan topish oson bo'lgan yakka so'zlar beradi
+        prompt = (
+            f"Siz professional bojxona deklarantisiz. Foydalanuvchi '{message.text}' deb kiritdi. "
+            f"Ushbu mahsulotni TIF TN bazasidan topish uchun 3 ta eng muhim kalit so'zni "
+            f"kirill alifbosida, faqat vergul bilan ajratib yozing. "
+            f"Masalan: 'Playstation' bo'lsa, 'видео ўйин, консол, ускуна' deb yozing."
+        )
         response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+        
         if response and response.text:
-            keywords = [k.strip() for k in response.text.strip().split(',') if len(k.strip()) > 2]
+            # AI dan kelgan so'zlarni massivga olamiz
+            raw_keywords = response.text.strip().replace('*', '').split(',')
+            keywords = [k.strip() for k in raw_keywords if len(k.strip()) > 2]
+            
             found = False
             for kw in keywords:
+                # get_dynamic_pattern so'zning o'zagini qidiradi
                 pattern = f"(?:{get_dynamic_pattern(kw)})|(?:{get_dynamic_pattern(to_cyrillic(kw))})"
-                if df['description'].astype(str).str.contains(pattern, case=False, na=False, regex=True).any():
+                
+                # Bazadan qidirish
+                mask = df['description'].astype(str).str.contains(pattern, case=False, na=False, regex=True)
+                if mask.any():
                     await st.delete()
+                    # Agar topilsa, o'sha kalit so'z bo'yicha natijalarni chiqaramiz
                     await send_results(message, kw, 0, "name")
-                    found = True; break
-            if not found: await st.edit_text(escape_md("❌ AI moslik topolmadi."), parse_mode="MarkdownV2")
-        else: await st.edit_text("❌ AI javob bermadi.")
-    except: await st.edit_text("❌ Xatolik.")
+                    found = True
+                    break
+            
+            if not found:
+                await st.edit_text(
+                    escape_md(f"❌ AI '{', '.join(keywords)}' so'zlarini taklif qildi, lekin bazadan moslik topilmadi."), 
+                    parse_mode="MarkdownV2"
+                )
+        else:
+            await st.edit_text("❌ AI tahlil qila olmadi.")
+    except Exception as e:
+        logging.error(f"AI Error: {e}")
+        await st.edit_text("❌ Xatolik yuz berdi.")
     await state.clear()
 
 # ==========================================
