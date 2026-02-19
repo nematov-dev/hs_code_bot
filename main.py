@@ -197,7 +197,7 @@ async def start_cmd(message: types.Message):
     kb = [
         [KeyboardButton(text="🔎 Nom bo'yicha"), KeyboardButton(text="🔢 Kod bo'yicha")],
         [KeyboardButton(text="🤖 AI qidiruv"), KeyboardButton(text="👤 Hisobim")],
-        [KeyboardButton(text="📗 Foydali bo'lim")]
+        [KeyboardButton(text="📗 Foydali bo'lim"),KeyboardButton(text="📖 Qo'llanma")]
     ]
     if message.from_user.id == ADMIN_ID:
         kb.append([KeyboardButton(text="⚙️ Admin Panel")])
@@ -218,6 +218,20 @@ async def profile(message: types.Message):
     text = (f"🆔 *ID:* `{message.from_user.id}`\n"
             f"📊 *Tarif:* {status}\n"
             f"📅 *Muddati:* {date_str}")
+    await message.answer(text, parse_mode="MarkdownV2")
+
+@dp.message(F.text == "📖 Qo'llanma")
+async def manual_cmd(message: types.Message):
+    text = (
+        "📚 *Botdan foydalanish bo'yicha qo'llanma:*\n\n"
+        "1️⃣ *Nom bo'yicha:* Mahsulot nomini kiritasiz va bazadan mos keluvchi TIF TN kodlarini topasiz.\n"
+        "2️⃣ *Kod bo'yicha:* Agar sizda kod bo'lsa, uning tavsifini va o'lchov birligini bilish uchun foydalaning.\n"
+        "3️⃣ *AI qidiruv (Premium):* Mahsulotni xalq tilida tasvirlang, Sun'iy intellekt uni bojxona terminologiyasiga o'girib qidiradi.\n"
+        "4️⃣ *Foydali bo'lim:* TIF TN qoidalari va o'lchov birliklari haqida PDF hujjatlar.\n"
+        "5️⃣ *Hisobim:* ID raqamingiz va premium muddatini ko'rish.\n\n"
+        "🌟 *Premium obuna:* AI qidiruvdan cheksiz foydalanish uchun @ZufarNurmatov ga murojaat qiling.\n\n"
+        "❗ *Kodlar faqat tavsiya sifatida beriladi*"
+    )
     await message.answer(text, parse_mode="MarkdownV2")
 
 @dp.message(F.text == "📗 Foydali bo'lim")
