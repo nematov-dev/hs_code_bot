@@ -16,7 +16,9 @@ import google.generativeai as genai
 from aiogram.types import FSInputFile
 from decouple import config
 
+# ==========================================
 # SOZLAMALAR
+# ==========================================
 BOT_TOKEN = config("BOT_TOKEN")
 GEMINI_API_KEY = config("GEMINI_API_KEY")
 ADMIN_ID = config("ADMIN_ID", cast=int)
@@ -35,7 +37,9 @@ gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
 logging.basicConfig(level=logging.INFO)
 
-# MAXSUS FUNKSIYALAR
+# ==========================================
+# YORDAMCHI FUNKSIYALAR
+# ==========================================
 def escape_md(text):
     if text is None: return ""
     parse_chars = r'_*[]()~`>#+-=|{}.!'
@@ -51,7 +55,9 @@ def to_cyrillic(text):
     for lat, cyr in mapping.items(): text = text.replace(lat, cyr)
     return text
 
+# ==========================================
 # MA'LUMOTLAR BAZASI
+# ==========================================
 def init_db():
     try:
         conn = psycopg2.connect(**DB_CONFIG)
@@ -71,7 +77,9 @@ def init_db():
 
 init_db()
 
-# MIDDLEWARE
+# ==========================================
+# MIDDLEWARE (OBUNA TEKSHIRISH)
+# ==========================================
 class SubscriptionMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
@@ -102,7 +110,9 @@ class SubscriptionMiddleware(BaseMiddleware):
         
         return await handler(event, data)
 
-# CSV YUKLASH
+# ==========================================
+# CSV MA'LUMOTLARNI YUKLASH
+# ==========================================
 try:
     df = pd.read_csv(CSV_FILE)
     df = df.iloc[:, [0, 1, 2]] 
@@ -120,8 +130,11 @@ class Form(StatesGroup):
     by_code = State()
     by_ai = State()
     admin_give_id = State()
+    admin_broadcast = State()
 
-# SEND_RESULTS
+# ==========================================
+# NATIJALARNI YUBORISH FUNKSIYASI
+# ==========================================
 async def send_results(message_obj, query, page, s_type):
     items_per_page = 5
     start_idx = page * items_per_page
@@ -175,7 +188,9 @@ async def send_results(message_obj, query, page, s_type):
     except Exception as e:
         logging.error(f"TG Send Error: {e}")
 
-# --- HANDLERLAR ---
+# ==========================================
+# ASOSIY HANDLERLAR
+# ==========================================
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
@@ -233,7 +248,10 @@ async def send_docs(message: types.Message):
 async def go_home(message: types.Message):
     await start_cmd(message)
 
-# QIDIRUVLAR
+# ==========================================
+# QIDIRUV HANDLERLARI
+# ==========================================
+
 @dp.message(F.text == "🔎 Nom bo'yicha")
 async def n_q(message: types.Message, state: FSMContext): 
     await state.set_state(Form.by_name)
@@ -256,7 +274,9 @@ async def c_h(message: types.Message, state: FSMContext):
     else: await message.answer("❌ Faqat raqam kiriting.")
     await state.clear()
 
-# AI QIDIRUV
+# ==========================================
+# AI QIDIRUV (GEMINI)
+# ==========================================
 @dp.message(F.text == "🤖 AI qidiruv")
 async def ai_q(message: types.Message, state: FSMContext): 
     await state.set_state(Form.by_ai)
@@ -267,7 +287,7 @@ async def ai_h(message: types.Message, state: FSMContext):
     st = await message.answer(escape_md("🤖 AI Deklarant tahlil qilmoqda..."), parse_mode="MarkdownV2")
     try:
         prompt = (f"Siz professional bojxona deklarantisiz. Foydalanuvchi '{message.text}' deb kiritdi. "
-                  f"TIF TN bazasi uchun 3 ta kalit so'zni kirillda, vergul bilan yozing.")
+                  f"TIF TN bazasi uchun 3 ta kalit so'zni kirillda, faqat vergul bilan yozing.")
         response = await asyncio.to_thread(gemini_model.generate_content, prompt)
         if response and response.text:
             keywords = [k.strip() for k in response.text.strip().split(',') if len(k.strip()) > 2]
@@ -283,7 +303,10 @@ async def ai_h(message: types.Message, state: FSMContext):
     except: await st.edit_text("❌ Xatolik.")
     await state.clear()
 
-# ADMIN PANEL
+# ==========================================
+# ADMIN PANEL VA BARCHAGA XABAR (MAILING)
+# ==========================================
+
 @dp.message(F.text == "⚙️ Admin Panel", F.from_user.id == ADMIN_ID)
 async def admin_main(message: types.Message):
     conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
@@ -291,16 +314,43 @@ async def admin_main(message: types.Message):
     cur.execute("SELECT COUNT(*) FROM users_hs WHERE is_premium = TRUE"); premiums = cur.fetchone()[0]
     cur.close(); conn.close()
     stat_text = (f"📊 *Statistika*\n\n👥 Jami: `{total}`\n🌟 Premium: `{premiums}`")
-    ikb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Obuna Berish", callback_data="adm_sub")]])
+    ikb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Obuna Berish", callback_data="adm_sub")],
+        [InlineKeyboardButton(text="📢 Barchaga Xabar", callback_data="adm_broadcast")]
+    ])
     await message.answer(stat_text, reply_markup=ikb, parse_mode="MarkdownV2")
 
-@dp.callback_query(F.data == "adm_sub")
-async def sub_start(call: types.CallbackQuery, state: FSMContext):
-    await state.set_state(Form.admin_give_id)
-    await call.message.answer("Premium beriladigan foydalanuvchi ID raqamini kiriting:")
+@dp.callback_query(F.data == "adm_broadcast", F.from_user.id == ADMIN_ID)
+async def broadcast_start(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(Form.admin_broadcast)
+    await call.message.answer("Barcha foydalanuvchilarga yuboriladigan xabarni yozing:")
     await call.answer()
 
-@dp.message(Form.admin_give_id)
+@dp.message(Form.admin_broadcast, F.from_user.id == ADMIN_ID)
+async def broadcast_process(message: types.Message, state: FSMContext):
+    text = message.text
+    conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users_hs"); users = cur.fetchall()
+    cur.close(); conn.close()
+    
+    count = 0
+    for user in users:
+        try:
+            await bot.send_message(user[0], text)
+            count += 1
+            await asyncio.sleep(0.05)
+        except: continue
+    
+    await message.answer(f"✅ {count} ta foydalanuvchiga xabar yuborildi.")
+    await state.clear()
+
+@dp.callback_query(F.data == "adm_sub", F.from_user.id == ADMIN_ID)
+async def sub_start(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(Form.admin_give_id)
+    await call.message.answer("Foydalanuvchi ID raqamini kiriting:")
+    await call.answer()
+
+@dp.message(Form.admin_give_id, F.from_user.id == ADMIN_ID)
 async def sub_id_received(message: types.Message, state: FSMContext):
     if not message.text.isdigit(): return await message.answer("Faqat raqam!")
     await state.update_data(target_id=message.text)
@@ -310,7 +360,7 @@ async def sub_id_received(message: types.Message, state: FSMContext):
     ])
     await message.answer(f"ID: {message.text} uchun muddatni tanlang:", reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("dur_"))
+@dp.callback_query(F.data.startswith("dur_"), F.from_user.id == ADMIN_ID)
 async def sub_finish(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data(); target_id = int(data.get("target_id"))
     days = int(call.data.split("_")[1])
@@ -320,15 +370,12 @@ async def sub_finish(call: types.CallbackQuery, state: FSMContext):
     cur.execute("UPDATE users_hs SET is_premium = TRUE, sub_end_date = %s WHERE user_id = %s", (new_end, target_id))
     conn.commit(); cur.close(); conn.close()
     
-    await call.message.edit_text(escape_md(f"✅ ID {target_id} uchun {days} kunlik premium faollashtirildi."), parse_mode="MarkdownV2")
+    await call.message.edit_text(f"✅ ID {target_id} uchun {days} kunlik premium faollashtirildi.")
     
-    # FOYDALANUVCHIGA XABAR YUBORISH
     try:
-        msg = f"🎉 Tabriklaymiz! Sizga {days} kunlik Premium obuna berildi.\nAmal qilish muddati: {new_end.strftime('%d.%m.%Y')}"
-        await bot.send_message(target_id, escape_md(msg), parse_mode="MarkdownV2")
-    except Exception as e:
-        logging.error(f"Userga xabar ketmadi: {e}")
-        
+        msg = f"🎉 Tabriklaymiz! Sizga {days} kunlik Premium obuna berildi.\nMuddat: {new_end.strftime('%d.%m.%Y %H:%M')}"
+        await bot.send_message(target_id, msg)
+    except: pass
     await state.clear()
 
 @dp.callback_query(F.data.startswith(("next_", "prev_")))
@@ -339,6 +386,9 @@ async def pagin(call: types.CallbackQuery):
     await send_results(call, query, new_page, s_type)
     await call.answer()
 
+# ==========================================
+# ISHGA TUSHIRISH
+# ==========================================
 async def main():
     await dp.start_polling(bot)
 
