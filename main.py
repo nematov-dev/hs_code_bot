@@ -1,28 +1,24 @@
 import os
-import re
-import pandas as pd
 import logging
 import asyncio
 import psycopg2
 from datetime import datetime, timedelta
+import json
 
-from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-import google.generativeai as genai
-from aiogram.types import FSInputFile
+from groq import Groq
 from decouple import config
 
 # ==========================================
 # SOZLAMALAR
 # ==========================================
 BOT_TOKEN = config("BOT_TOKEN")
-GEMINI_API_KEY = config("GEMINI_API_KEY")
+GROQ_API_KEY = config("GROQ_API_KEY")
 ADMIN_ID = config("ADMIN_ID", cast=int)
-CSV_FILE = "documents/hs_codes_uz.csv"
 
 DB_CONFIG = {
     "dbname": config("DB_NAME"),
@@ -32,409 +28,359 @@ DB_CONFIG = {
     "port": config("DB_PORT", cast=int)
 }
 
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+# Groq mijozini sozlash
+client = Groq(api_key=GROQ_API_KEY)
 
 logging.basicConfig(level=logging.INFO)
-
-# ==========================================
-# YORDAMCHI FUNKSIYALAR
-# ==========================================
-def escape_md(text):
-    if text is None: return ""
-    parse_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(parse_chars)}])', r'\\\1', str(text))
-
-def get_dynamic_pattern(query):
-    q = query.lower().replace('к', '[кх]').replace('х', '[кх]')
-    return rf"(?:^|\s|\b){q}(?:лар|li|idagi|ning|ni|ga|lari)?(?:\b|\s|$)"
-
-def to_cyrillic(text):
-    mapping = {"sh": "ш", "ch": "ч", "yo'": "йў", "yo": "ё", "yu": "ю", "ya": "я", "ye": "е", "o'": "ў", "g'": "ғ", "a": "а", "b": "б", "v": "в", "g": "г", "d": "д", "e": "е", "j": "ж", "z": "з", "i": "и", "y": "й", "k": "к", "l": "л", "m": "м", "n": "н", "o": "о", "p": "п", "r": "р", "s": "с", "t": "т", "u": "у", "f": "ф", "x": "х", "h": "ҳ", "q": "қ", "ts": "ц"}
-    text = text.lower()
-    for lat, cyr in mapping.items(): text = text.replace(lat, cyr)
-    return text
 
 # ==========================================
 # MA'LUMOTLAR BAZASI
 # ==========================================
 def init_db():
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users_hs (
-                user_id BIGINT PRIMARY KEY,
-                join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_premium BOOLEAN DEFAULT FALSE,
-                sub_end_date TIMESTAMP DEFAULT NULL
-            );
-        """)
-        conn.commit()
-        cur.close(); conn.close()
-    except Exception as e:
-        logging.error(f"Baza xatosi: {e}")
+    conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users_hs (
+            user_id BIGINT PRIMARY KEY,
+            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_premium BOOLEAN DEFAULT FALSE,
+            sub_end_date TIMESTAMP DEFAULT NULL,
+            requests_today INTEGER DEFAULT 0,
+            last_request_date DATE DEFAULT CURRENT_DATE
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            id SERIAL PRIMARY KEY,
+            daily_limit INTEGER DEFAULT 10
+        );
+    """)
+    cur.execute("INSERT INTO bot_settings (id, daily_limit) VALUES (1, 10) ON CONFLICT DO NOTHING;")
+    conn.commit(); cur.close(); conn.close()
 
 init_db()
 
 # ==========================================
-# MIDDLEWARE (OBUNA TEKSHIRISH)
+# YORDAMCHI FUNKSIYALAR
 # ==========================================
-class SubscriptionMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        user = data.get("event_from_user")
-        if not user: return await handler(event, data)
-        
-        conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
-        cur.execute("SELECT is_premium, sub_end_date FROM users_hs WHERE user_id = %s", (user.id,))
-        res = cur.fetchone()
-        
-        if not res:
-            cur.execute("INSERT INTO users_hs (user_id) VALUES (%s)", (user.id,))
-            conn.commit()
-            is_premium, sub_end_date = False, None
-        else:
-            is_premium, sub_end_date = res
+def get_limit():
+    conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
+    cur.execute("SELECT daily_limit FROM bot_settings WHERE id = 1")
+    res = cur.fetchone()[0]
+    cur.close(); conn.close()
+    return res
 
-        if is_premium and sub_end_date and sub_end_date < datetime.now():
-            cur.execute("UPDATE users_hs SET is_premium = FALSE WHERE user_id = %s", (user.id,))
-            conn.commit()
-            is_premium = False
-
-        cur.close(); conn.close()
-        
-        if isinstance(event, types.Message) and event.text == "🤖 AI qidiruv":
-            if user.id != ADMIN_ID and not is_premium:
-                await event.answer(escape_md("⚠️ AI qidiruv faqat Premium foydalanuvchilar uchun!\nAdmin: @ZufarNurmatov"), parse_mode="MarkdownV2")
-                return
-        
-        return await handler(event, data)
+async def get_user_data(user_id):
+    conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
+    cur.execute("SELECT is_premium, sub_end_date, requests_today, last_request_date FROM users_hs WHERE user_id = %s", (user_id,))
+    res = cur.fetchone()
+    if not res:
+        cur.execute("INSERT INTO users_hs (user_id) VALUES (%s)", (user_id,))
+        conn.commit()
+        res = (False, None, 0, datetime.now().date())
+    cur.close(); conn.close()
+    return res
 
 # ==========================================
-# CSV MA'LUMOTLARNI YUKLASH
+# STATES
 # ==========================================
-try:
-    df = pd.read_csv(CSV_FILE)
-    df = df.iloc[:, [0, 1, 2]] 
-    df.columns = ['code', 'description', 'unity']
-    df['clean_code'] = df['code'].astype(str).str.replace(r'\D', '', regex=True)
-except Exception as e:
-    logging.error(f"CSV xatosi: {e}")
+class Form(StatesGroup):
+    ai_ask = State()
+    admin_mail = State()
+    admin_limit = State()
+    admin_sub_id = State()
 
+# ==========================================
+# BOT BOSHQARUVI
+# ==========================================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-dp.message.middleware(SubscriptionMiddleware())
 
-class Form(StatesGroup):
-    by_name = State()
-    by_code = State()
-    by_ai = State()
-    admin_give_id = State()
-    admin_broadcast = State()
-
-# ==========================================
-# NATIJALARNI YUBORISH FUNKSIYASI
-# ==========================================
-async def send_results(message_obj, query, page, s_type):
-    items_per_page = 5
-    start_idx = page * items_per_page
+@dp.message(Form.ai_ask, F.text == "🚫 Bekor qilish")
+async def cancel_ai(message: types.Message, state: FSMContext):
+    await state.clear()
     
-    if s_type == "name":
-        pattern = f"(?:{get_dynamic_pattern(query)})|(?:{get_dynamic_pattern(to_cyrillic(query))})"
-        mask = df['description'].astype(str).str.contains(pattern, case=False, na=False, regex=True)
-        filtered_indices = df.index[mask].tolist()
-    else: 
-        mask = df['clean_code'].str.startswith(query)
-        filtered_indices = df.index[mask].tolist()
-
-    if not filtered_indices:
-        text = escape_md("❌ Hech narsa topilmadi.")
-        if isinstance(message_obj, types.Message): await message_obj.answer(text, parse_mode="MarkdownV2")
-        else: await message_obj.message.edit_text(text, parse_mode="MarkdownV2")
-        return
-
-    current_batch = filtered_indices[start_idx : start_idx + items_per_page]
-    res_count = len(filtered_indices)
-    text = f"🔍 *Natijalar:* `{res_count}` ta \(Sahifa: `{page+1}`\)\n"
-
-    for idx in current_batch:
-        row = df.iloc[idx]
-        code, description = str(row['code']), str(row['description'])
-        clean_code = str(row['clean_code'])
-        unity = str(row['unity']) if pd.notna(row['unity']) else "-"
-
-        if len(clean_code) < 4: continue
-
-        item_text = f"{escape_md('-' * 25)}\n"
-        item_text += f"🔢 *KOD:* `{escape_md(code)}`\n"
-        item_text += f"📝 *TASNIF:* {escape_md(description)}\n"
-        if len(clean_code) == 10:
-            item_text += f"📌 *BIRLIK:* `{escape_md(unity)}`\n"
-        text += item_text
-
-    builder = InlineKeyboardBuilder()
-    if page > 0:
-        builder.add(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"prev_{s_type}_{query}_{page}"))
-    if len(filtered_indices) > start_idx + items_per_page:
-        builder.add(InlineKeyboardButton(text="Oldinga ➡️", callback_data=f"next_{s_type}_{query}_{page}"))
-    
-    if len(text) > 4000: text = text[:4000] + "\.\.\."
-
-    try:
-        if isinstance(message_obj, types.Message): 
-            await message_obj.answer(text, parse_mode="MarkdownV2", reply_markup=builder.as_markup())
-        else: 
-            await message_obj.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=builder.as_markup())
-    except Exception as e:
-        logging.error(f"TG Send Error: {e}")
-
-# ==========================================
-# ASOSIY HANDLERLAR
-# ==========================================
+    # Asosiy menyu tugmalarini qaytarish
+    kb = [
+        [KeyboardButton(text="🤖 AI Agentga so'rov")],
+        [KeyboardButton(text="👤 Hisobim"), KeyboardButton(text="🌟 Premium olish")],
+        [KeyboardButton(text="📚 Foydali bo'lim"), KeyboardButton(text="📖 Qo'llanma")]
+    ]
+    if message.from_user.id == ADMIN_ID:
+        kb.append([KeyboardButton(text="⚙️ Admin Panel")])
+        
+    await message.answer(
+        "❌ AI so'rovi bekor qilindi.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    )
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     kb = [
-        [KeyboardButton(text="🔎 Nom bo'yicha"), KeyboardButton(text="🔢 Kod bo'yicha")],
-        [KeyboardButton(text="🤖 AI qidiruv"), KeyboardButton(text="👤 Hisobim")],
-        [KeyboardButton(text="📗 Foydali bo'lim"),KeyboardButton(text="📖 Qo'llanma")]
+        [KeyboardButton(text="🤖 AI Agentga so'rov")],
+        [KeyboardButton(text="👤 Hisobim"), KeyboardButton(text="🌟 Premium olish")],
+        [KeyboardButton(text="📚 Foydali bo'lim"), KeyboardButton(text="📖 Qo'llanma")]
     ]
     if message.from_user.id == ADMIN_ID:
         kb.append([KeyboardButton(text="⚙️ Admin Panel")])
     
     await message.answer(
-        escape_md("TIF TN kodlarini qidirish botiga xush kelibsiz!"), 
-        reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True), 
-        parse_mode="MarkdownV2"
+        "Xush kelibsiz! Men TIF TN kodlarini aniqlovchi AI Agentman.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
     )
+
+@dp.message(F.text == "📚 Foydali bo'lim")
+async def useful_section(message: types.Message):
+    text = (
+        "📚 **Foydali ma'lumotlar va hujjatlar bo'limi**\n\n"
+        "Kerakli bo'limni tanlang, men sizga tegishli ma'lumot va PDF faylni yuboraman:"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📖 TIF TN Qoidalari", callback_data="useful_rules")],
+        [InlineKeyboardButton(text="🔤 Qisqartmalar va Ramzlar", callback_data="useful_abbr")],
+        [InlineKeyboardButton(text="⚖️ O'lchov birliklari", callback_data="useful_units")],
+    ])
+    
+    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+from aiogram.types import FSInputFile # Fayllarni yuborish uchun kerak
+
+@dp.callback_query(F.data.startswith("useful_"))
+async def useful_callback(call: types.CallbackQuery):
+    data = call.data.split("_")[1]
+
+
+    try:
+        if data == "rules":
+            caption = "📄 **TIF TN qoidalari.**"
+            file = FSInputFile("documents/qoidalar.pdf")
+            await call.message.answer_document(document=file, caption=caption, parse_mode="Markdown")
+            
+        elif data == "abbr":
+            caption = "🔤 **Qisqartmalar va ramzlar ro'yxati.**"
+            file = FSInputFile("documents/qisqartmalar.pdf")
+            await call.message.answer_document(document=file, caption=caption, parse_mode="Markdown")
+            
+        elif data == "units":
+            caption = "⚖️ **TIF TN o'lchov birliklari.**"
+            file = FSInputFile("documents/birliklar.pdf")
+            await call.message.answer_document(document=file, caption=caption, parse_mode="Markdown")
+            
+    except Exception as e:
+        logging.error(f"Fayl yuborishda xatolik: {e}")
+        await call.message.answer("❌ Kechirasiz, faylni yuklashda xatolik yuz berdi. Texnik bo'limga xabar berildi.")
+    
+    await call.answer()
+
 
 @dp.message(F.text == "📖 Qo'llanma")
 async def manual_cmd(message: types.Message):
-    # Matnni oddiy formatda yozib, keyin escape qilamiz
-    raw_text = (
-        "📚 Botdan foydalanish bo'yicha qo'llanma:\n\n"
-        "1. Nom bo'yicha: Mahsulot nomini kiritasiz va bazadan mos keluvchi TIF TN kodlarini topasiz.\n"
-        "2. Kod bo'yicha: Agar sizda kod bo'lsa, uning tavsifini va o'lchov birligini bilish uchun foydalaning.\n"
-        "3. AI qidiruv (Premium): Mahsulotni xalq tilida tasvirlang, AI uni qidiradi.\n"
-        "4. Foydali bo'lim: TIF TN qoidalari va PDF hujjatlar.\n"
-        "5. Hisobim: ID raqamingiz va premium muddatini ko'rish.\n\n"
-        "🌟 Premium obuna olish uchun: @ZufarNurmatov\n\n"
-        "❗ Kodlar faqat tavsiya sifatida beriladi!"
+    text = (
+        "📘 **Botdan foydalanish yo'riqnomasi:**\n\n"
+        "1. **🤖 AI Agentga so'rov'** tugmasini bosing.\n"
+        "2. Mahsulot nomini, modelini va xususiyatlarini yozing.\n"
+        "3. AI sizga TIF TN kodi va tavsifni taqdim etadi.\n\n"
+        "⚠️ **DIQQAT:**\n"
+        "Bot tomonidan taqdim etilgan TIF TN kodlari va ma'lumotlar **faqat tavsiya sifatida** taqdim etiladi. "
+        "Bojxona rasmiylashtiruvi jarayonida xatoliklarga yo'l qo'ymaslik uchun, ma'lumotlarni rasmiy "
+        "bojxona organlari ma'lumotlari orqali qayta tekshirib ko'rishingizni so'raymiz.\n\n"
     )
-    
-    # escape_md funksiyasi orqali xavfsiz holatga keltiramiz
-    safe_text = escape_md(raw_text)
-    
-    # Muhim: qalin matnlarni escape_md dan keyin qo'lda belgilash xavfsizroq
-    safe_text = safe_text.replace("Botdan foydalanish bo'yicha qo'llanma", "*Botdan foydalanish bo'yicha qo'llanma*")
-    
-    await message.answer(safe_text, parse_mode="MarkdownV2")
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "🌟 Premium olish")
+async def manual_cmd(message: types.Message):
+    text = (
+        "📘 **Premium olish uchun admin bilan bog'laning: @ZufarNurmatov**\n\n"
+        )
+    await message.answer(text, parse_mode="Markdown")
 
 @dp.message(F.text == "👤 Hisobim")
 async def profile(message: types.Message):
-    conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
-    cur.execute("SELECT is_premium, sub_end_date FROM users_hs WHERE user_id = %s", (message.from_user.id,))
-    res = cur.fetchone(); cur.close(); conn.close()
-    status = "🌟 Premium" if res and res[0] else "🆓 Tekin"
-    date_str = escape_md(res[1].strftime('%d.%m.%Y %H:%M')) if res and res[1] else "Mavjud emas"
-    text = (f"🆔 *ID:* `{message.from_user.id}`\n"
-            f"📊 *Tarif:* {status}\n"
-            f"📅 *Muddati:* {date_str}")
-    await message.answer(text, parse_mode="MarkdownV2")
+    is_prem, sub_end, req_today, last_date = await get_user_data(message.from_user.id)
+    limit = get_limit()
+    status = "🌟 Premium" if is_prem else "🆓 Tekin"
+    rem = "Cheksiz" if is_prem else f"{req_today}/{limit}"
+    
+    text = (f"🆔 ID: `{message.from_user.id}`\n"
+            f"📊 Tarif: {status}\n"
+            f"🔄 Bugungi so'rovlar: {rem}")
+    await message.answer(text, parse_mode="Markdown")
 
-
-@dp.message(F.text == "📗 Foydali bo'lim")
-async def useful_section(message: types.Message):
-    kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📖 TIF TN Qoidalari")],
-        [KeyboardButton(text="🔤 Qisqartmalar va Ramzlar")],
-        [KeyboardButton(text="⚖️ O'lchov birliklari")],
-        [KeyboardButton(text="🏠 Bosh sahifa")]
-    ], resize_keyboard=True)
-    await message.answer("Kerakli hujjatni tanlang:", reply_markup=kb)
-
-@dp.message(F.text.in_(["📖 TIF TN Qoidalari", "🔤 Qisqartmalar va Ramzlar", "⚖️ O'lchov birliklari"]))
-async def send_docs(message: types.Message):
-    docs = {
-        "📖 TIF TN Qoidalari": ("qoidalar.pdf", "TIF TN talqin etish qoidalari"),
-        "🔤 Qisqartmalar va Ramzlar": ("qisqartmalar.pdf", "Qisqartmalar va ramzlar ro'yxati"),
-        "⚖️ O'lchov birliklari": ("birliklar.pdf", "TIF TN o'lchov birliklari")
-    }
-    file_info = docs.get(message.text)
-    try:
-        file = FSInputFile(f"documents/{file_info[0]}")
-        await message.answer_document(document=file, caption=file_info[1])
-    except:
-        await message.answer("❌ Hujjat serverdan topilmadi.")
-
-@dp.message(F.text == "🏠 Bosh sahifa")
-async def go_home(message: types.Message):
-    await start_cmd(message)
-
-# ==========================================
-# QIDIRUV HANDLERLARI
-# ==========================================
-
-@dp.message(F.text == "🔎 Nom bo'yicha")
-async def n_q(message: types.Message, state: FSMContext): 
-    await state.set_state(Form.by_name)
-    await message.answer("🔍 Mahsulot nomini kiriting:")
-
-@dp.message(Form.by_name)
-async def n_h(message: types.Message, state: FSMContext): 
-    await send_results(message, message.text, 0, "name")
-    await state.clear()
-
-@dp.message(F.text == "🔢 Kod bo'yicha")
-async def c_q(message: types.Message, state: FSMContext): 
-    await state.set_state(Form.by_code)
-    await message.answer("🔢 Kodning raqamlarini kiriting:")
-
-@dp.message(Form.by_code)
-async def c_h(message: types.Message, state: FSMContext):
-    clean_query = re.sub(r'\D', '', message.text)
-    if clean_query: await send_results(message, clean_query, 0, "code")
-    else: await message.answer("❌ Faqat raqam kiriting.")
-    await state.clear()
-
-# ==========================================
-# AI QIDIRUV (GEMINI)
-# ==========================================
-@dp.message(F.text == "🤖 AI qidiruv")
-async def ai_q(message: types.Message, state: FSMContext): 
-    await state.set_state(Form.by_ai)
-    await message.answer("Mahsulotni tasvirlang (AI eng mos terminni topadi):")
-
-@dp.message(Form.by_ai)
-async def ai_h(message: types.Message, state: FSMContext):
-    st = await message.answer(escape_md("🤖 AI Deklarant tahlil qilmoqda..."), parse_mode="MarkdownV2")
-    try:
-        # Prompt o'zgartirildi: AI endi murakkab jumla emas, bazadan topish oson bo'lgan yakka so'zlar beradi
-        prompt = (
-            f"Siz professional bojxona deklarantisiz. Foydalanuvchi '{message.text}' deb kiritdi. "
-            f"Ushbu mahsulotni TIF TN bazasidan topish uchun 3 ta eng muhim kalit so'zni "
-            f"kirill alifbosida, faqat vergul bilan ajratib yozing. "
-            f"Masalan: 'Playstation' bo'lsa, 'видео ўйин, консол, ускуна' deb yozing."
-        )
-        response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+@dp.message(F.text == "🤖 AI Agentga so'rov")
+async def ai_start(message: types.Message, state: FSMContext):
+    is_prem, _, req_today, last_date = await get_user_data(message.from_user.id)
+    limit = get_limit()
+    
+    if not is_prem and last_date == datetime.now().date() and req_today >= limit:
+        await message.answer("⚠️ Bugungi bepul limitingiz tugadi. Premiumga o'ting!")
+        return
         
-        if response and response.text:
-            # AI dan kelgan so'zlarni massivga olamiz
-            raw_keywords = response.text.strip().replace('*', '').split(',')
-            keywords = [k.strip() for k in raw_keywords if len(k.strip()) > 2]
-            
-            found = False
-            for kw in keywords:
-                # get_dynamic_pattern so'zning o'zagini qidiradi
-                pattern = f"(?:{get_dynamic_pattern(kw)})|(?:{get_dynamic_pattern(to_cyrillic(kw))})"
-                
-                # Bazadan qidirish
-                mask = df['description'].astype(str).str.contains(pattern, case=False, na=False, regex=True)
-                if mask.any():
-                    await st.delete()
-                    # Agar topilsa, o'sha kalit so'z bo'yicha natijalarni chiqaramiz
-                    await send_results(message, kw, 0, "name")
-                    found = True
-                    break
-            
-            if not found:
-                await st.edit_text(
-                    escape_md(f"❌ AI '{', '.join(keywords)}' so'zlarini taklif qildi, lekin bazadan moslik topilmadi."), 
-                    parse_mode="MarkdownV2"
-                )
-        else:
-            await st.edit_text("❌ AI tahlil qila olmadi.")
+    await state.set_state(Form.ai_ask)
+    
+    # Bekor qilish tugmasini yaratish
+    cancel_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🚫 Bekor qilish")]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    
+    await message.answer(
+        "Mahsulotingizni batafsil yozing:\n\n"
+        "Jarayonni to'xtatish uchun pastdagi tugmani bosing.",
+        reply_markup=cancel_kb
+    )
+
+
+@dp.message(Form.ai_ask)
+async def ai_handler(message: types.Message, state: FSMContext):
+    wait = await message.answer("🔍 Tahlil qilinmoqda...")
+    current_year = datetime.now().year
+    
+    system_prompt = (
+        "Siz O'zbekiston Respublikasi professional bojxona deklarantisiz. "
+        "Foydalanuvchi mahsuloti uchun TIF TN kodini ierarxik (ota koddan sub-kodgacha) aniqlang. "
+        f"Foydalanuvchi mahsuloti uchun {current_year}-yilgi TIF TN tasniflagichi bo'yicha "        "Javobni FAQAT quyidagi JSON formatida qaytaring (o'zbek tilida): "
+        "{"
+        '  "ierarxiya": ['
+        '    {"daraja": "Guruh (2 raqam)", "kod": "kod", "tavsif": "tavsif"},'
+        '    {"daraja": "Pozitsiya (4 raqam)", "kod": "kod", "tavsif": "tavsif"},'
+        '    {"daraja": "Sub-pozitsiya (10 raqam)", "kod": "kod", "tavsif": "tavsif"}'
+        '  ],'
+        '  "olchov_birligi": "dona/kg/..." '
+        "}"
+    )
+
+    try:
+        completion = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Mahsulot: {message.text}"}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1
+        )
+        
+        res_content = completion.choices[0].message.content
+        data = json.loads(res_content)
+        
+        # Ierarxik matnni shakllantirish
+        hierarchy_text = ""
+        for item in data.get('ierarxiya', []):
+            hierarchy_text += f"🔹 **{item['daraja']}**: `{item['kod']}`\n└ {item['tavsif']}\n\n"
+        
+        result_text = (
+            f"📦 **Mahsulot:** {message.text}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"{hierarchy_text}"
+            f"📏 **O‘lchov birligi:** {data.get('olchov_birligi')}\n"
+            f"━━━━━━━━━━━━━━━"
+        )
+
+        # Baza bilan ishlash (Limitni yangilash)
+        conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
+        cur.execute("UPDATE users_hs SET requests_today = requests_today + 1 WHERE user_id = %s", (message.from_user.id,))
+        conn.commit(); cur.close(); conn.close()
+        
+        await wait.delete()
+        await message.answer(result_text, parse_mode="Markdown", disable_web_page_preview=True)
+
     except Exception as e:
-        logging.error(f"AI Error: {e}")
-        await st.edit_text("❌ Xatolik yuz berdi.")
-    await state.clear()
-
+        logging.error(f"Ierarxiya xatosi: {e}")
+        await wait.edit_text("❌ Ma'lumot topilmadi yoki ierarxik tahlilda xatolik yuz berdi.")
+    
 # ==========================================
-# ADMIN PANEL VA BARCHAGA XABAR (MAILING)
+# ADMIN PANEL (Statistika va Boshqaruv)
 # ==========================================
-
 @dp.message(F.text == "⚙️ Admin Panel", F.from_user.id == ADMIN_ID)
-async def admin_main(message: types.Message):
+async def admin_panel(message: types.Message):
     conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users_hs"); total = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM users_hs WHERE is_premium = TRUE"); premiums = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users_hs")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users_hs WHERE is_premium = TRUE")
+    prems = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users_hs WHERE join_date >= CURRENT_DATE")
+    today = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users_hs WHERE join_date >= CURRENT_DATE - INTERVAL '7 days'")
+    week = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users_hs WHERE join_date >= CURRENT_DATE - INTERVAL '30 days'")
+    month = cur.fetchone()[0]
     cur.close(); conn.close()
-    stat_text = (f"📊 *Statistika*\n\n👥 Jami: `{total}`\n🌟 Premium: `{premiums}`")
-    ikb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Obuna Berish", callback_data="adm_sub")],
-        [InlineKeyboardButton(text="📢 Barchaga Xabar", callback_data="adm_broadcast")]
+    
+    text = (f"📊 **Statistika**\n\n"
+            f"👥 Jami: `{total}` | 🌟 Premium: `{prems}`\n"
+            f"🆓 Oddiy: `{total - prems}`\n\n"
+            f"📈 **Yangi userlar:**\n"
+            f"📅 Bugun: `{today}`\n"
+            f"🗓 Hafta: `{week}`\n"
+            f"🌙 Oy: `{month}`\n\n"
+            f"⚙️ Limit: `{get_limit()}`")
+            
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Xabar", callback_data="a_mail"), InlineKeyboardButton(text="🔢 Limit", callback_data="a_limit")],
+        [InlineKeyboardButton(text="💎 Obuna berish", callback_data="a_sub")]
     ])
-    await message.answer(stat_text, reply_markup=ikb, parse_mode="MarkdownV2")
+    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
 
-@dp.callback_query(F.data == "adm_broadcast", F.from_user.id == ADMIN_ID)
-async def broadcast_start(call: types.CallbackQuery, state: FSMContext):
-    await state.set_state(Form.admin_broadcast)
-    await call.message.answer("Barcha foydalanuvchilarga yuboriladigan xabarni yozing:")
+# Admin callbacklari (limit, mail, sub) yuqoridagi Gemini kodi bilan bir xil ishlaydi
+@dp.callback_query(F.data == "a_limit", F.from_user.id == ADMIN_ID)
+async def a_lim(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(Form.admin_limit)
+    await call.message.answer("Limitni son bilan kiriting:")
     await call.answer()
 
-@dp.message(Form.admin_broadcast, F.from_user.id == ADMIN_ID)
-async def broadcast_process(message: types.Message, state: FSMContext):
-    text = message.text
+@dp.message(Form.admin_limit)
+async def a_lim_done(message: types.Message, state: FSMContext):
+    if message.text.isdigit():
+        conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
+        cur.execute("UPDATE bot_settings SET daily_limit = %s WHERE id = 1", (int(message.text),))
+        conn.commit(); cur.close(); conn.close()
+        await message.answer("✅ Limit yangilandi.")
+        await state.clear()
+
+@dp.callback_query(F.data == "a_mail", F.from_user.id == ADMIN_ID)
+async def a_ml(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(Form.admin_mail)
+    await call.message.answer("Xabarni yuboring:")
+    await call.answer()
+
+@dp.message(Form.admin_mail)
+async def a_ml_done(message: types.Message, state: FSMContext):
     conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
     cur.execute("SELECT user_id FROM users_hs"); users = cur.fetchall()
     cur.close(); conn.close()
-    
-    count = 0
-    for user in users:
-        try:
-            await bot.send_message(user[0], text)
-            count += 1
-            await asyncio.sleep(0.05)
+    for u in users:
+        try: await bot.send_message(u[0], message.text)
         except: continue
-    
-    await message.answer(f"✅ {count} ta foydalanuvchiga xabar yuborildi.")
+    await message.answer("✅ Xabar yuborildi.")
     await state.clear()
 
-@dp.callback_query(F.data == "adm_sub", F.from_user.id == ADMIN_ID)
-async def sub_start(call: types.CallbackQuery, state: FSMContext):
-    await state.set_state(Form.admin_give_id)
-    await call.message.answer("Foydalanuvchi ID raqamini kiriting:")
+@dp.callback_query(F.data == "a_sub", F.from_user.id == ADMIN_ID)
+async def a_sb(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(Form.admin_sub_id)
+    await call.message.answer("Foydalanuvchi ID sini kiriting:")
     await call.answer()
 
-@dp.message(Form.admin_give_id, F.from_user.id == ADMIN_ID)
-async def sub_id_received(message: types.Message, state: FSMContext):
-    if not message.text.isdigit(): return await message.answer("Faqat raqam!")
-    await state.update_data(target_id=message.text)
+@dp.message(Form.admin_sub_id)
+async def a_sb_id(message: types.Message, state: FSMContext):
+    await state.update_data(t_id=message.text)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1 Kun", callback_data="dur_1"), InlineKeyboardButton(text="1 Hafta", callback_data="dur_7")],
-        [InlineKeyboardButton(text="1 Oy", callback_data="dur_30"), InlineKeyboardButton(text="1 Yil", callback_data="dur_365")]
+        [InlineKeyboardButton(text="1 kun", callback_data="p_1"), InlineKeyboardButton(text="1 hafta", callback_data="p_7")],
+        [InlineKeyboardButton(text="1 oy", callback_data="p_30"), InlineKeyboardButton(text="1 yil", callback_data="p_365")]
     ])
-    await message.answer(f"ID: {message.text} uchun muddatni tanlang:", reply_markup=kb)
+    await message.answer("Muddatni tanlang:", reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("dur_"), F.from_user.id == ADMIN_ID)
-async def sub_finish(call: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data(); target_id = int(data.get("target_id"))
+@dp.callback_query(F.data.startswith("p_"))
+async def a_sb_final(call: types.CallbackQuery, state: FSMContext):
     days = int(call.data.split("_")[1])
-    
+    data = await state.get_data(); t_id = int(data['t_id'])
+    end_d = datetime.now() + timedelta(days=days)
     conn = psycopg2.connect(**DB_CONFIG); cur = conn.cursor()
-    new_end = datetime.now() + timedelta(days=days)
-    cur.execute("UPDATE users_hs SET is_premium = TRUE, sub_end_date = %s WHERE user_id = %s", (new_end, target_id))
+    cur.execute("UPDATE users_hs SET is_premium = TRUE, sub_end_date = %s WHERE user_id = %s", (end_d, t_id))
     conn.commit(); cur.close(); conn.close()
-    
-    await call.message.edit_text(f"✅ ID {target_id} uchun {days} kunlik premium faollashtirildi.")
-    
-    try:
-        msg = f"🎉 Tabriklaymiz! Sizga {days} kunlik Premium obuna berildi.\nMuddat: {new_end.strftime('%d.%m.%Y %H:%M')}"
-        await bot.send_message(target_id, msg)
-    except: pass
+    await call.message.answer(f"✅ ID {t_id} premium qilindi.")
     await state.clear()
 
-@dp.callback_query(F.data.startswith(("next_", "prev_")))
-async def pagin(call: types.CallbackQuery):
-    parts = call.data.split("_")
-    action, s_type, query, page = parts[0], parts[1], parts[2], int(parts[3])
-    new_page = page + 1 if action == "next" else max(0, page - 1)
-    await send_results(call, query, new_page, s_type)
-    await call.answer()
-
-# ==========================================
-# ISHGA TUSHIRISH
-# ==========================================
 async def main():
     await dp.start_polling(bot)
 
